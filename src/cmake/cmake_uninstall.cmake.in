@@ -1,0 +1,17 @@
+if(NOT EXISTS "@CMAKE_CURRENT_BINARY_DIR@/install_manifest.txt")
+  message(FATAL_ERROR "Cannot find install manifest: \"@CMAKE_CURRENT_BINARY_DIR@/install_manifest.txt\"")
+endif()
+
+file(STRINGS "@CMAKE_CURRENT_BINARY_DIR@/install_manifest.txt" files ENCODING UTF-8)
+foreach(file IN LISTS files)
+  message(STATUS "Uninstalling \"$ENV{DESTDIR}${file}\"")
+  if(EXISTS "$ENV{DESTDIR}${file}" OR IS_SYMLINK "$ENV{DESTDIR}${file}")
+    file(REMOVE "$ENV{DESTDIR}${file}")
+    # file(REMOVE) does not report files it fails to remove
+    if(EXISTS "$ENV{DESTDIR}${file}" OR IS_SYMLINK "$ENV{DESTDIR}${file}")
+      message(FATAL_ERROR "Problem when removing \"$ENV{DESTDIR}${file}\"")
+    endif()
+  else()
+    message(STATUS "File \"$ENV{DESTDIR}${file}\" does not exist.")
+  endif()
+endforeach()

@@ -1,0 +1,225 @@
+/*
+ * This file is part of the GROMACS molecular simulation package.
+ *
+ * Copyright 2016- The GROMACS Authors
+ * and the project initiators Erik Lindahl, Berk Hess and David van der Spoel.
+ * Consult the AUTHORS/COPYING files and https://www.gromacs.org for details.
+ *
+ * GROMACS is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public License
+ * as published by the Free Software Foundation; either version 2.1
+ * of the License, or (at your option) any later version.
+ *
+ * GROMACS is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with GROMACS; if not, see
+ * https://www.gnu.org/licenses, or write to the Free Software Foundation,
+ * Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA.
+ *
+ * If you want to redistribute modifications to GROMACS, please
+ * consider that scientific software is very special. Version
+ * control is crucial - bugs must be traceable. We will be happy to
+ * consider code for inclusion in the official distribution, but
+ * derived work must not be called official GROMACS. Details are found
+ * in the README & COPYING files - if they are missing, get the
+ * official version at https://www.gromacs.org.
+ *
+ * To help us fund GROMACS development, we humbly ask that you cite
+ * the research papers on the package. Check out https://www.gromacs.org.
+ */
+#include "gmxpre.h"
+
+#include "mdsetup.h"
+
+#include <memory>
+#include <vector>
+
+#include "gromacs/domdec/domdec.h"
+#include "gromacs/domdec/domdec_struct.h"
+#include "gromacs/domdec/localtopology.h"
+#include "gromacs/ewald/pme.h"
+#include "gromacs/ewald/pme_pp.h"
+#include "gromacs/listed_forces/listed_forces.h"
+#include "gromacs/mdlib/constr.h"
+#include "gromacs/mdlib/vsite.h"
+#include "gromacs/mdlib/wholemoleculetransform.h"
+#include "gromacs/mdtypes/commrec.h"
+#include "gromacs/mdtypes/forcebuffers.h"
+#include "gromacs/mdtypes/forcerec.h"
+#include "gromacs/mdtypes/inputrec.h"
+#include "gromacs/mdtypes/interaction_const.h"
+#include "gromacs/mdtypes/md_enums.h"
+#include "gromacs/mdtypes/mdatoms.h"
+#include "gromacs/mdtypes/state_propagator_data_gpu.h"
+#include "gromacs/pbcutil/pbc.h"
+#include "gromacs/topology/idef.h"
+#include "gromacs/topology/mtop_util.h"
+#include "gromacs/topology/topology.h"
+#include "gromacs/utility/arrayref.h"
+#include "gromacs/utility/gmxassert.h"
+
+namespace gmx
+{
+
+/* TODO: Add a routine that collects the initial setup of the algorithms.
+ *
+ * The final solution should be an MD algorithm base class with methods
+ * for initialization and atom-data setup.
+ */
+void mdAlgorithmsSetupAtomData(const SimulationWorkload& simulationWork,
+                               gmx_domdec_t*             dd,
+                               const t_inputrec&         inputrec,
+                               const gmx_mtop_t&         top_global,
+                               gmx_localtop_t*           top,
+                               t_forcerec*               fr,
+                               ForceBuffers*             force,
+                               const real                massLambda,
+                               MDAtoms*                  mdAtomsModifiable,
+                               Constraints*              constr,
+                               VirtualSitesHandler*      vsite,
+                               shellfc_t*                shellfc,
+                               StatePropagatorDataGpu*   stateGpu,
+                               gmx_wallcycle*            wcycle)
+{
+    int                 numHomeAtoms;
+    int                 numTotalAtoms;
+    ArrayRef<const int> globalAtomIndices;
+
+    if (dd)
+    {
+        numHomeAtoms      = dd_numHomeAtoms(*dd);
+        numTotalAtoms     = dd_natoms_mdatoms(*dd);
+        globalAtomIndices = dd->globalAtomIndices;
+        GMX_RELEASE_ASSERT(numTotalAtoms == globalAtomIndices.ssize(),
+                           "Total atoms should match size of global atom indices\n");
+    }
+    else
+    {
+        numHomeAtoms  = top_global.natoms;
+        numTotalAtoms = top_global.natoms;
+    }
+
+    if (force != nullptr)
+    {
+        force->resize(numTotalAtoms);
+    }
+
+    mdAtomsModifiable->updateAfterPartition(numTotalAtoms, globalAtomIndices, numHomeAtoms, massLambda);
+
+    // No changes to mdAtoms after here
+    const MDAtoms& mdAtoms = *mdAtomsModifiable;
+
+    if (dd == nullptr)
+    {
+        gmx_mtop_generate_local_top(top_global, top, inputrec.efep != FreeEnergyPerturbationType::No);
+    }
+
+    if (fr->wholeMoleculeTransform && dd)
+    {
+        fr->wholeMoleculeTransform->updateAtomOrder(dd->globalAtomIndices, *dd->ga2la);
+    }
+
+    if (vsite)
+    {
+        vsite->setVirtualSites(top->idef.il, numTotalAtoms, mdAtoms.numHomeAtoms, mdAtoms.ptype);
+    }
+
+    /* Note that with DD only flexible constraints, not shells, are supported
+     * and these don't require setup in make_local_shells().
+     *
+     * TODO: This should only happen in ShellFCElement (it is called directly by the modular
+     *       simulator ShellFCElement already, but still used here by legacy simulators)
+     */
+    if (dd == nullptr && shellfc)
+    {
+        make_local_shells(dd, mdAtoms, shellfc);
+    }
+
+    // TODO: warning/error if posresCom and posresComB do not have the same size
+    for (auto& listedForces : fr->listedForces)
+    {
+        listedForces.setup(top->idef, fr->natoms_force, fr->listedForcesGpu != nullptr, mdAtoms.cVCM);
+    }
+
+    if (usingPme(fr->ic->coulomb.type) || usingLJPme(fr->ic->vdw.type))
+    {
+        if (!fr->pmePpComm)
+        {
+            // This handles the PP+PME rank case where fr->pmedata is valid.
+            // For PME-only ranks, gmx_pmeonly() has its own call to gmx_pme_reinit_atoms().
+            const int numPmeAtoms = numHomeAtoms - fr->n_tpi;
+            gmx_pme_reinit_atoms(fr->pmedata.get(), numPmeAtoms, mdAtoms.chargeA, mdAtoms.chargeB);
+        }
+        else
+        {
+            // PP rank partnered with a PME-only rank
+
+            // Send the charges and/or c6/sigmas to the PME-only rank
+            // and prepare for PP-rank operations.
+            fr->pmePpComm->sendParameters(dd_numHomeAtoms(*dd),
+                                          mdAtoms.nChargePerturbed != 0,
+                                          mdAtoms.nTypePerturbed != 0,
+                                          mdAtoms.chargeA,
+                                          mdAtoms.chargeB,
+                                          mdAtoms.sqrt_c6A,
+                                          mdAtoms.sqrt_c6B,
+                                          mdAtoms.sigmaA,
+                                          mdAtoms.sigmaB,
+                                          dd_pme_maxshift_x(*dd),
+                                          dd_pme_maxshift_y(*dd));
+        }
+    }
+
+    // Note that this must follow the call to send parameters to the
+    // PME-only rank, so that it can do the symmetric reallocation
+    // within stateGpu for NVSHMEM at the same time on all ranks.
+    if (needStateGpu(simulationWork))
+    {
+        // Does global communication and symmetric reallocation with NVSHMEM
+        stateGpu->reinit(mdAtoms.numHomeAtoms,
+                         simulationWork.havePpDomainDecomposition ? dd_numAtomsZones(*dd)
+                                                                  : mdAtoms.numHomeAtoms);
+    }
+
+    // Now that the number of halo-exchange pulses is determined and
+    // stateGpu is updated, the halo exchange objects can
+    // be constructed and/or updated.
+    if (simulationWork.useGpuHaloExchange)
+    {
+        GMX_RELEASE_ASSERT(fr->deviceStreamManager != nullptr,
+                           "GPU device manager has to be initialized to use GPU "
+                           "halo exchange.");
+        // When using NVSHMEM, we use the PP rank which receives
+        // virial and energy from PME rank to send the data about
+        // the number of halo-exchange pulses to the PME rank.
+        std::optional<int> rankOfControlledPmeRank;
+        if (simulationWork.useNvshmem && simulationWork.haveSeparatePmeRank)
+        {
+            // When there is a separate PME rank, only one PP rank
+            // controls it, and that PP rank returns a valid value
+            // here.
+            rankOfControlledPmeRank = fr->pmePpComm->rankOfControlledPmeRank();
+        }
+        // Does global communication and symmetric reallocation.
+        // Might be doing the initial construction.
+        constructOrUpdateGpuHaloExchange(dd,
+                                         *fr->deviceStreamManager,
+                                         simulationWork.useNvshmem,
+                                         rankOfControlledPmeRank,
+                                         stateGpu->getCoordinates(),
+                                         stateGpu->getForces(),
+                                         wcycle);
+    }
+
+    if (constr)
+    {
+        constr->setConstraints(
+                top, numTotalAtoms, mdAtoms.numHomeAtoms, mdAtoms.massT, mdAtoms.invmass, massLambda, mdAtoms.cFREEZE);
+    }
+}
+
+} // namespace gmx

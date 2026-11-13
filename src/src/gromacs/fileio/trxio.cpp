@@ -1,0 +1,1338 @@
+/*
+ * This file is part of the GROMACS molecular simulation package.
+ *
+ * Copyright 1991- The GROMACS Authors
+ * and the project initiators Erik Lindahl, Berk Hess and David van der Spoel.
+ * Consult the AUTHORS/COPYING files and https://www.gromacs.org for details.
+ *
+ * GROMACS is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public License
+ * as published by the Free Software Foundation; either version 2.1
+ * of the License, or (at your option) any later version.
+ *
+ * GROMACS is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with GROMACS; if not, see
+ * https://www.gnu.org/licenses, or write to the Free Software Foundation,
+ * Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA.
+ *
+ * If you want to redistribute modifications to GROMACS, please
+ * consider that scientific software is very special. Version
+ * control is crucial - bugs must be traceable. We will be happy to
+ * consider code for inclusion in the official distribution, but
+ * derived work must not be called official GROMACS. Details are found
+ * in the README & COPYING files - if they are missing, get the
+ * official version at https://www.gromacs.org.
+ *
+ * To help us fund GROMACS development, we humbly ask that you cite
+ * the research papers on the package. Check out https://www.gromacs.org.
+ */
+#include "gmxpre.h"
+
+#include "gromacs/fileio/trxio.h"
+
+#include "config.h"
+
+#include <cassert>
+#include <cinttypes>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+
+#include <filesystem>
+#include <memory>
+#include <optional>
+#include <string>
+#include <vector>
+
+#include "gromacs/fileio/checkpoint.h"
+#include "gromacs/fileio/cifio.h"
+#include "gromacs/fileio/confio.h"
+#include "gromacs/fileio/filetypes.h"
+#include "gromacs/fileio/g96io.h"
+#include "gromacs/fileio/gmxfio.h"
+#include "gromacs/fileio/gmxfio_xdr.h"
+#include "gromacs/fileio/groio.h"
+#include "gromacs/fileio/h5md/h5md.h"
+#include "gromacs/fileio/oenv.h"
+#include "gromacs/fileio/pdbio.h"
+#include "gromacs/fileio/timecontrol.h"
+#include "gromacs/fileio/tngio.h"
+#include "gromacs/fileio/tpxio.h"
+#include "gromacs/fileio/trrio.h"
+#include "gromacs/fileio/xdrf.h"
+#include "gromacs/fileio/xtcio.h"
+#include "gromacs/mdtypes/inputrec.h"
+#include "gromacs/mdtypes/md_enums.h"
+#include "gromacs/topology/atoms.h"
+#include "gromacs/topology/symtab.h"
+#include "gromacs/topology/topology.h"
+#include "gromacs/trajectory/trajectoryframe.h"
+#include "gromacs/utility/arrayref.h"
+#include "gromacs/utility/basedefinitions.h"
+#include "gromacs/utility/cstringutil.h"
+#include "gromacs/utility/exceptions.h"
+#include "gromacs/utility/fatalerror.h"
+#include "gromacs/utility/functions.h"
+#include "gromacs/utility/futil.h"
+#include "gromacs/utility/gmxassert.h"
+#include "gromacs/utility/real.h"
+#include "gromacs/utility/smalloc.h"
+#include "gromacs/utility/unique_cptr.h"
+#include "gromacs/utility/vec.h"
+#include "gromacs/utility/vectypes.h"
+
+struct gmx_output_env_t;
+
+#if GMX_USE_PLUGINS
+#    include "gromacs/fileio/vmdio.h"
+#endif
+
+/* defines for frame counter output */
+#define SKIP1 10
+#define SKIP2 100
+#define SKIP3 1000
+
+struct t_trxstatus
+{
+    int    flags        = 0; /* flags for read_first/next_frame  */
+    int    currentFrame = -1;
+    double t0           = 0;                /* time of the first frame, needed  *
+                                             * for skipping frames with -dt     */
+    real                       tf = 0;      /* internal frame time              */
+    gmx::TimeControl           timeControl; /* time control for read_first/next_frame */
+    t_trxframe*                xframe = nullptr;
+    t_fileio*                  fio    = nullptr;
+    gmx_tng_trajectory_t       tng    = nullptr;
+    std::unique_ptr<gmx::H5md> h5md;
+    int                        fileType = efNR;
+    int                        natoms   = 0;
+    std::vector<char>          persistent_line; /* Persistent line for reading g96 trajectories */
+    std::unique_ptr<CifTrajectory> cifReader; /* Parsed multi-model mmCIF being read frame by frame */
+    int numCifModelsWritten = 0; /* Number of models already streamed to an mmCIF trajectory */
+#if GMX_USE_PLUGINS
+    gmx_vmdplugin_t* vmdplugin;
+#endif
+};
+
+/* utility functions */
+
+gmx_bool bRmod_fd(double a, double b, double c, gmx_bool compareTimesAsDouble)
+{
+    int    iq;
+    double tol;
+
+    tol = 2 * (compareTimesAsDouble ? GMX_DOUBLE_EPS : GMX_FLOAT_EPS);
+
+    iq = static_cast<int>((a - b + tol * a) / c);
+
+    return std::fabs(a - b - c * iq) <= tol * std::fabs(a);
+}
+
+
+/* This routine checks if the read-in time is correct or not;
+ * returns -1 if t < timeControl.begin or t MOD timeControl.delta == t0,
+ *          0 if timeControl.begin <= t <= timeControl.end + margin,
+ *          1 if t > timeControl.end
+ * where margin is 0.1*min(t-tp,tp-tpp), if this positive, 0 otherwise.
+ * tp and tpp should be the time of the previous frame and the one before.
+ * The mod is done with single or double precision accuracy depending
+ * on the value of compareTimesAsDouble. That value should be true only when
+ * a double-precision build of GROMACS is reading a file written in
+ * double precision.
+ */
+static int check_times2(real t, real t0, const gmx::TimeControl& timeControl, gmx_bool compareTimesAsDouble)
+{
+    GMX_ASSERT(GMX_DOUBLE || !compareTimesAsDouble,
+               "Only a double-precision build can compare times as double");
+    int r;
+
+    r              = -1;
+    auto startTime = timeControl.begin;
+    auto endTime   = timeControl.end;
+    auto deltaTime = timeControl.delta;
+    if ((!startTime.has_value() || (t >= startTime.value()))
+        && (!endTime.has_value() || (t <= endTime.value())))
+    {
+        if (deltaTime.has_value() && !bRmod_fd(t, t0, deltaTime.value(), compareTimesAsDouble))
+        {
+            r = -1;
+        }
+        else
+        {
+            r = 0;
+        }
+    }
+    else if (endTime.has_value() && (t >= endTime.value()))
+    {
+        r = 1;
+    }
+    if (debug)
+    {
+        fprintf(debug,
+                "t=%g, t0=%g, b=%g, e=%g, dt=%g: r=%d\n",
+                t,
+                t0,
+                startTime.value_or(0),
+                endTime.value_or(0),
+                deltaTime.value_or(0),
+                r);
+    }
+    return r;
+}
+
+int check_times(real t, const gmx::TimeControl& timeControl)
+{
+    return check_times2(t, t, timeControl, FALSE);
+}
+
+static void initcount(t_trxstatus* status)
+{
+    status->currentFrame = -1;
+}
+
+int nframes_read(t_trxstatus* status)
+{
+    return status->currentFrame;
+}
+
+bool trxio_should_print_count(const gmx_output_env_t* oenv, t_trxstatus* status)
+{
+    return ((status->currentFrame < 2 * SKIP1 || status->currentFrame % SKIP1 == 0)
+            && (status->currentFrame < 2 * SKIP2 || status->currentFrame % SKIP2 == 0)
+            && (status->currentFrame < 2 * SKIP3 || status->currentFrame % SKIP3 == 0)
+            && output_env_get_trajectory_io_verbosity(oenv) != 0);
+}
+
+static void printcount_(t_trxstatus* status, const gmx_output_env_t* oenv, const char* l, real t)
+{
+    if (trxio_should_print_count(oenv, status))
+    {
+        fprintf(stderr, "\r%-14s %6d time %8.3f   ", l, status->currentFrame, output_env_conv_time(oenv, t));
+        std::fflush(stderr);
+    }
+}
+
+static void printcount(t_trxstatus* status, const gmx_output_env_t* oenv, real t, gmx_bool bSkip)
+{
+    status->currentFrame++;
+    printcount_(status, oenv, bSkip ? "Skipping frame" : "Reading frame", t);
+}
+
+static void printlast(t_trxstatus* status, const gmx_output_env_t* oenv, real t)
+{
+    printcount_(status, oenv, "Last frame", t);
+    fprintf(stderr, "\n");
+    std::fflush(stderr);
+}
+
+static void printincomp(t_trxstatus* status, t_trxframe* fr)
+{
+    if (fr->not_ok & HEADER_NOT_OK)
+    {
+        fprintf(stderr, "WARNING: Incomplete header: nr %d time %g\n", status->currentFrame + 1, fr->time);
+    }
+    else if (fr->not_ok)
+    {
+        fprintf(stderr, "WARNING: Incomplete frame: nr %d time %g\n", status->currentFrame + 1, fr->time);
+    }
+    std::fflush(stderr);
+}
+
+int prec2ndec(real prec)
+{
+    if (prec <= 0)
+    {
+        gmx_fatal(FARGS, "DEATH HORROR prec (%g) <= 0 in prec2ndec", prec);
+    }
+
+    return gmx::roundToInt(std::log(prec) / std::log(10.0));
+}
+
+real ndec2prec(int ndec)
+{
+    return std::pow(10.0, ndec);
+}
+
+t_fileio* trx_get_fileio(t_trxstatus* status)
+{
+    return status->fio;
+}
+
+double trx_get_time_of_final_frame(t_trxstatus* status)
+{
+    t_fileio* stfio    = trx_get_fileio(status);
+    int       fileType = status->fileType;
+    gmx_bool  bOK;
+    double    lasttime = -1;
+
+    if (fileType == efXTC)
+    {
+        lasttime = xdr_xtc_get_last_frame_time(
+                gmx_fio_getfp(stfio), gmx_fio_getxdr(stfio), status->natoms, &bOK);
+        if (!bOK)
+        {
+            gmx_fatal(FARGS, "Error reading last frame. Maybe seek not supported.");
+        }
+    }
+    else if (fileType == efTNG)
+    {
+        gmx_tng_trajectory_t tng = status->tng;
+        if (!tng)
+        {
+            gmx_fatal(FARGS, "Error opening TNG file.");
+        }
+        lasttime = gmx_tng_get_time_of_final_frame(tng);
+    }
+    else
+    {
+        gmx_incons("Only supported for TNG and XTC");
+    }
+    return lasttime;
+}
+
+void clear_trxframe(t_trxframe* fr, gmx_bool bFirst)
+{
+    fr->not_ok       = 0;
+    fr->bStep        = FALSE;
+    fr->bTime        = FALSE;
+    fr->timeIsDouble = false;
+    fr->bLambda      = FALSE;
+    fr->bFepState    = FALSE;
+    fr->bAtoms       = FALSE;
+    fr->bPrec        = FALSE;
+    fr->bX           = FALSE;
+    fr->bV           = FALSE;
+    fr->bF           = FALSE;
+    fr->bBox         = FALSE;
+    if (bFirst)
+    {
+        fr->natoms    = -1;
+        fr->step      = 0;
+        fr->time      = 0;
+        fr->lambda    = 0;
+        fr->fep_state = 0;
+        fr->atoms     = nullptr;
+        fr->prec      = 0;
+        fr->x         = nullptr;
+        fr->v         = nullptr;
+        fr->f         = nullptr;
+        clear_mat(fr->box);
+        fr->bPBC    = FALSE;
+        fr->pbcType = PbcType::Unset;
+        fr->bIndex  = false;
+        fr->index   = nullptr;
+    }
+}
+
+void setTrxFramePbcType(t_trxframe* fr, PbcType pbcType)
+{
+    fr->bPBC    = (pbcType != PbcType::Unset);
+    fr->pbcType = pbcType;
+}
+
+int write_trxframe_indexed(t_trxstatus* status, const t_trxframe* fr, int nind, const int* ind, gmx_conect gc)
+{
+    char  title[STRLEN];
+    rvec *xout = nullptr, *vout = nullptr, *fout = nullptr;
+    int   i;
+    real  prec;
+
+    if (fr->bPrec)
+    {
+        prec = fr->prec;
+    }
+    else
+    {
+        prec = 1000.0;
+    }
+
+    switch (status->fileType)
+    {
+        case efTRR:
+        case efTNG: break;
+        default:
+            if (!fr->bX)
+            {
+                gmx_fatal(FARGS, "Need coordinates to write a %s trajectory", ftp2ext(status->fileType));
+            }
+            break;
+    }
+
+    switch (status->fileType)
+    {
+        case efTRR:
+        case efTNG:
+            if (fr->bV)
+            {
+                snew(vout, nind);
+                for (i = 0; i < nind; i++)
+                {
+                    copy_rvec(fr->v[ind[i]], vout[i]);
+                }
+            }
+            if (fr->bF)
+            {
+                snew(fout, nind);
+                for (i = 0; i < nind; i++)
+                {
+                    copy_rvec(fr->f[ind[i]], fout[i]);
+                }
+            }
+            if (fr->bX)
+            {
+                snew(xout, nind);
+                for (i = 0; i < nind; i++)
+                {
+                    copy_rvec(fr->x[ind[i]], xout[i]);
+                }
+            }
+            break;
+        case efXTC:
+            if (fr->bX)
+            {
+                snew(xout, nind);
+                for (i = 0; i < nind; i++)
+                {
+                    copy_rvec(fr->x[ind[i]], xout[i]);
+                }
+            }
+            break;
+        default: break;
+    }
+
+    switch (status->fileType)
+    {
+        case efTNG: gmx_write_tng_from_trxframe(status->tng, fr, nind); break;
+        case efH5MD: throw gmx::NotImplementedError("H5MD reading/writing not yet implemented");
+        case efXTC: write_xtc(status->fio, nind, fr->step, fr->time, fr->box, xout, prec); break;
+        case efTRR:
+            gmx_trr_write_frame(
+                    status->fio, nframes_read(status), fr->time, fr->step, fr->box, nind, xout, vout, fout);
+            break;
+        case efGRO:
+        case efPDB:
+        case efBRK:
+        case efENT:
+            if (!fr->bAtoms)
+            {
+                gmx_fatal(FARGS, "Can not write a %s file without atom names", ftp2ext(status->fileType));
+            }
+            sprintf(title, "frame t= %.3f", fr->time);
+            if (status->fileType == efGRO)
+            {
+                write_hconf_indexed_p(gmx_fio_getfp(status->fio),
+                                      title,
+                                      fr->atoms,
+                                      nind,
+                                      ind,
+                                      fr->x,
+                                      fr->bV ? fr->v : nullptr,
+                                      fr->box);
+            }
+            else
+            {
+                write_pdbfile_indexed(gmx_fio_getfp(status->fio),
+                                      title,
+                                      fr->atoms,
+                                      fr->x,
+                                      fr->bPBC ? fr->pbcType : PbcType::Unset,
+                                      fr->box,
+                                      ' ',
+                                      fr->step,
+                                      nind,
+                                      ind,
+                                      gc,
+                                      FALSE);
+            }
+            break;
+        case efCIF:
+            if (!fr->bAtoms)
+            {
+                gmx_fatal(FARGS, "Can not write a %s file without atom names", ftp2ext(status->fileType));
+            }
+            CifIO::writeTrajectoryFrame(gmx_fio_getfp(status->fio),
+                                        nullptr,
+                                        fr->atoms,
+                                        fr->x,
+                                        fr->box,
+                                        nind,
+                                        ind,
+                                        status->numCifModelsWritten + 1,
+                                        status->numCifModelsWritten == 0,
+                                        gc);
+            status->numCifModelsWritten++;
+            break;
+        case efG96:
+            sprintf(title, "frame t= %.3f", fr->time);
+            write_g96_conf(gmx_fio_getfp(status->fio), title, fr, nind, ind);
+            break;
+        default:
+            gmx_fatal(FARGS, "Sorry, write_trxframe_indexed can not write %s", ftp2ext(status->fileType));
+    }
+
+    switch (status->fileType)
+    {
+        case efTRR:
+        case efTNG:
+            if (vout)
+            {
+                sfree(vout);
+            }
+            if (fout)
+            {
+                sfree(fout);
+            }
+            sfree(xout);
+            break;
+        case efXTC: sfree(xout); break;
+        default: break;
+    }
+
+    return 0;
+}
+
+t_trxstatus* trjtools_gmx_prepare_tng_writing(const std::filesystem::path& filename,
+                                              char                         filemode,
+                                              t_trxstatus*                 in,
+                                              const std::filesystem::path& infile,
+                                              const int                    natoms,
+                                              const gmx_mtop_t*            mtop,
+                                              gmx::ArrayRef<const int>     index,
+                                              const char*                  index_group_name)
+{
+    if (filemode != 'w' && filemode != 'a')
+    {
+        gmx_incons("Sorry, can only prepare for TNG output.");
+    }
+    t_trxstatus* out = new t_trxstatus;
+    out->fileType    = efTNG;
+
+    if (in != nullptr)
+    {
+        gmx_prepare_tng_writing(
+                filename, filemode, &in->tng, &out->tng, natoms, mtop, index, index_group_name);
+    }
+    else if (fn2ftp(infile) == efTNG)
+    {
+        gmx_tng_trajectory_t tng_in;
+        gmx_tng_open(infile, 'r', &tng_in);
+
+        gmx_prepare_tng_writing(
+                filename, filemode, &tng_in, &out->tng, natoms, mtop, index, index_group_name);
+    }
+    else
+    {
+        // we start from a file that is not a tng file or have been unable to load the
+        // input file, so we need to populate the fields independently of it
+        gmx_prepare_tng_writing(
+                filename, filemode, nullptr, &out->tng, natoms, mtop, index, index_group_name);
+    }
+    return out;
+}
+
+t_trxstatus* trjtools_gmx_prepare_h5md_writing(const std::filesystem::path& outputFileName,
+                                               t_trxstatus*                 inputFileStatus,
+                                               const int                    numParticles,
+                                               const gmx_mtop_t*            mtop,
+                                               const PbcType                pbcType,
+                                               gmx::ArrayRef<const int>     index)
+{
+    gmx::unique_cptr<t_trxstatus, close_trx> outputFileStatus(new t_trxstatus);
+
+    // At some point we may want this to also set up files for appending
+    // data, but for now we only allow new files to be created.
+    outputFileStatus->fileType = efH5MD;
+    outputFileStatus->h5md = std::make_unique<gmx::H5md>(outputFileName, gmx::H5mdFileMode::Write);
+    if (inputFileStatus != nullptr && inputFileStatus->h5md != nullptr)
+    {
+        try
+        {
+            outputFileStatus->h5md->setupFromOtherFile(*inputFileStatus->h5md, index, "system");
+        }
+        catch (const gmx::FileIOError&)
+        {
+            GMX_THROW(gmx::FileIOError(gmx::formatString(
+                    "Cannot read required data from input H5MD file when creating output file %s",
+                    outputFileName.string().c_str())));
+        }
+    }
+    else
+    {
+        // To set up the file we need the number of particles and pbc type
+        // for the system.
+        gmx_mtop_t mtopFallback;
+        mtopFallback.natoms = numParticles;
+        t_inputrec inputRecord;
+        inputRecord.pbcType = pbcType;
+
+        // We can only write the topology if we have one and we are writing
+        // data for the entire system (until we know what to do for selections)
+        const bool writeTopology = mtop != nullptr && mtop->natoms == numParticles;
+        outputFileStatus->h5md->setupFileFromInput(
+                writeTopology ? *mtop : mtopFallback, inputRecord, index, "system");
+    }
+
+    return outputFileStatus.release();
+}
+
+void write_tng_frame(t_trxstatus* status, const t_trxframe* frame)
+{
+    gmx_write_tng_from_trxframe(status->tng, frame, -1);
+}
+
+void write_h5md_frame(t_trxstatus* status, const t_trxframe& frame)
+{
+    status->h5md->writeNextFrame(
+            frame.bX ? gmx::constArrayRefFromArray(reinterpret_cast<const gmx::RVec*>(frame.x), frame.natoms)
+                     : gmx::ArrayRef<const gmx::RVec>{},
+            frame.bV ? gmx::constArrayRefFromArray(reinterpret_cast<const gmx::RVec*>(frame.v), frame.natoms)
+                     : gmx::ArrayRef<const gmx::RVec>{},
+            frame.bF ? gmx::constArrayRefFromArray(reinterpret_cast<const gmx::RVec*>(frame.f), frame.natoms)
+                     : gmx::ArrayRef<const gmx::RVec>{},
+            frame.box,
+            frame.step,
+            frame.time);
+}
+
+int write_trxframe(t_trxstatus* status, const t_trxframe* fr, gmx_conect gc)
+{
+    char title[STRLEN];
+    title[0] = '\0';
+    real prec;
+
+    if (fr->bPrec)
+    {
+        prec = fr->prec;
+    }
+    else
+    {
+        prec = 1000.0;
+    }
+
+    if (status->tng)
+    {
+        gmx_tng_set_compression_precision(status->tng, prec);
+        write_tng_frame(status, fr);
+
+        return 0;
+    }
+
+    switch (status->fileType)
+    {
+        case efTRR: break;
+        default:
+            if (!fr->bX)
+            {
+                gmx_fatal(FARGS, "Need coordinates to write a %s trajectory", ftp2ext(status->fileType));
+            }
+            break;
+    }
+
+    switch (status->fileType)
+    {
+        case efXTC:
+            write_xtc(status->fio, fr->natoms, fr->step, fr->time, fr->box, fr->x, prec);
+            break;
+        case efTRR:
+            gmx_trr_write_frame(status->fio,
+                                fr->step,
+                                fr->time,
+                                fr->lambda,
+                                fr->box,
+                                fr->natoms,
+                                fr->bX ? fr->x : nullptr,
+                                fr->bV ? fr->v : nullptr,
+                                fr->bF ? fr->f : nullptr);
+            break;
+        case efH5MD: throw gmx::NotImplementedError("H5MD reading/writing not yet implemented");
+        case efGRO:
+        case efPDB:
+        case efBRK:
+        case efENT:
+            if (!fr->bAtoms)
+            {
+                gmx_fatal(FARGS, "Can not write a %s file without atom names", ftp2ext(status->fileType));
+            }
+            sprintf(title, "frame t= %.3f", fr->time);
+            if (status->fileType == efGRO)
+            {
+                write_hconf_p(
+                        gmx_fio_getfp(status->fio), title, fr->atoms, fr->x, fr->bV ? fr->v : nullptr, fr->box);
+            }
+            else
+            {
+                write_pdbfile(gmx_fio_getfp(status->fio),
+                              title,
+                              fr->atoms,
+                              fr->x,
+                              fr->bPBC ? fr->pbcType : PbcType::Unset,
+                              fr->box,
+                              ' ',
+                              fr->step,
+                              gc);
+            }
+            break;
+        case efCIF:
+        {
+            if (!fr->bAtoms)
+            {
+                gmx_fatal(FARGS,
+                          "Can not write a %s file without atom names",
+                          ftp2ext(gmx_fio_getftp(status->fio)));
+            }
+            std::vector<int> allIndex(fr->natoms);
+            for (int i = 0; i < fr->natoms; i++)
+            {
+                allIndex[i] = i;
+            }
+            CifIO::writeTrajectoryFrame(gmx_fio_getfp(status->fio),
+                                        nullptr,
+                                        fr->atoms,
+                                        fr->x,
+                                        fr->box,
+                                        fr->natoms,
+                                        allIndex.data(),
+                                        status->numCifModelsWritten + 1,
+                                        status->numCifModelsWritten == 0,
+                                        gc);
+            status->numCifModelsWritten++;
+            break;
+        }
+        case efG96: write_g96_conf(gmx_fio_getfp(status->fio), title, fr, -1, nullptr); break;
+        default:
+            gmx_fatal(FARGS, "Sorry, write_trxframe can not write %s", ftp2ext(status->fileType));
+    }
+
+    return 0;
+}
+
+int write_trx(t_trxstatus*   status,
+              int            nind,
+              const int*     ind,
+              const t_atoms* atoms,
+              int            step,
+              double         time,
+              matrix         box,
+              rvec           x[],
+              rvec*          v,
+              gmx_conect     gc)
+{
+    t_trxframe fr;
+
+    clear_trxframe(&fr, TRUE);
+    fr.bStep  = TRUE;
+    fr.step   = step;
+    fr.bTime  = TRUE;
+    fr.time   = time;
+    fr.bAtoms = atoms != nullptr;
+    fr.atoms  = const_cast<t_atoms*>(atoms);
+    fr.bX     = TRUE;
+    fr.x      = x;
+    fr.bV     = v != nullptr;
+    fr.v      = v;
+    fr.bBox   = TRUE;
+    copy_mat(box, fr.box);
+
+    return write_trxframe_indexed(status, &fr, nind, ind, gc);
+}
+
+void close_trx(t_trxstatus* status)
+{
+    if (status == nullptr)
+    {
+        return;
+    }
+    gmx_tng_close(&status->tng);
+    if (status->fio)
+    {
+        gmx_fio_close(status->fio);
+    }
+#if GMX_USE_PLUGINS
+    delete status->vmdplugin;
+#endif
+    /* The memory in status->xframe is lost here,
+     * but the read_first_x/read_next_x functions are deprecated anyhow.
+     * read_first_frame/read_next_frame and close_trx should be used.
+     */
+    delete status;
+}
+
+void done_trx_xframe(t_trxstatus* status)
+{
+    gmx::done_frame(status->xframe);
+    sfree(status->xframe);
+}
+
+t_trxstatus* open_trx(const std::filesystem::path& outfile, const char* filemode)
+{
+    if (filemode[0] != 'w' && filemode[0] != 'a' && filemode[1] != '+')
+    {
+        gmx_fatal(FARGS, "Sorry, write_trx can only write");
+    }
+
+    t_trxstatus* stat = new t_trxstatus;
+
+    // Note this has probably never worked with TNG files
+    stat->fio      = gmx_fio_open(outfile, filemode);
+    stat->fileType = gmx_fio_getftp(stat->fio);
+    return stat;
+}
+
+static gmx_bool gmx_next_frame(t_trxstatus* status, t_trxframe* fr)
+{
+    gmx_trr_header_t sh;
+    gmx_bool         bOK, bRet;
+
+    bRet = FALSE;
+
+    if (gmx_trr_read_frame_header(status->fio, &sh, &bOK))
+    {
+        fr->natoms = sh.natoms;
+        fr->bStep  = TRUE;
+        fr->step   = sh.step;
+        fr->bTime  = TRUE;
+        fr->timeIsDouble = (std::is_same_v<decltype(sh.t), double> && gmx_fio_is_double(status->fio));
+        fr->time      = static_cast<double>(sh.t);
+        fr->bLambda   = TRUE;
+        fr->bFepState = TRUE;
+        fr->lambda    = sh.lambda;
+        fr->bBox      = sh.box_size > 0;
+        if (status->flags & (TRX_READ_X | TRX_NEED_X))
+        {
+            if (fr->x == nullptr)
+            {
+                snew(fr->x, sh.natoms);
+            }
+            fr->bX = sh.x_size > 0;
+        }
+        if (status->flags & (TRX_READ_V | TRX_NEED_V))
+        {
+            if (fr->v == nullptr)
+            {
+                snew(fr->v, sh.natoms);
+            }
+            fr->bV = sh.v_size > 0;
+        }
+        if (status->flags & (TRX_READ_F | TRX_NEED_F))
+        {
+            if (fr->f == nullptr)
+            {
+                snew(fr->f, sh.natoms);
+            }
+            fr->bF = sh.f_size > 0;
+        }
+        if (gmx_trr_read_frame_data(status->fio, &sh, fr->box, fr->x, fr->v, fr->f))
+        {
+            bRet = TRUE;
+        }
+        else
+        {
+            fr->not_ok = DATA_NOT_OK;
+        }
+    }
+    else if (!bOK)
+    {
+        fr->not_ok = HEADER_NOT_OK;
+    }
+
+    return bRet;
+}
+
+static gmx_bool pdb_next_x(t_trxstatus* status, FILE* fp, t_trxframe* fr)
+{
+    t_atoms   atoms;
+    t_symtab* symtab;
+    matrix    boxpdb;
+    // Initiate model_nr to -1 rather than NOTSET.
+    // It is not worthwhile introducing extra variables in the
+    // read_pdbfile call to verify that a model_nr was read.
+    PbcType pbcType;
+    int     model_nr = -1, na;
+    char    title[STRLEN], *time, *step;
+    double  dbl;
+
+    atoms.nr      = fr->natoms;
+    atoms.atom    = nullptr;
+    atoms.pdbinfo = nullptr;
+    /* the other pointers in atoms should not be accessed if these are NULL */
+    snew(symtab, 1);
+    open_symtab(symtab);
+    na = read_pdbfile(fp, title, &model_nr, &atoms, symtab, fr->x, &pbcType, boxpdb, nullptr);
+    free_symtab(symtab);
+    sfree(symtab);
+    setTrxFramePbcType(fr, pbcType);
+    if (nframes_read(status) == 0)
+    {
+        fprintf(stderr, " '%s', %d atoms\n", title, fr->natoms);
+    }
+    fr->bPrec = TRUE;
+    fr->prec  = 10000;
+    fr->bX    = TRUE;
+    fr->bBox  = (boxpdb[XX][XX] != 0.0);
+    if (fr->bBox)
+    {
+        copy_mat(boxpdb, fr->box);
+    }
+
+    fr->step  = 0;
+    step      = std::strstr(title, " step= ");
+    fr->bStep = ((step != nullptr) && sscanf(step + 7, "%" SCNd64, &fr->step) == 1);
+
+    dbl              = 0.0;
+    time             = std::strstr(title, " t= ");
+    fr->bTime        = ((time != nullptr) && sscanf(time + 4, "%lf", &dbl) == 1);
+    fr->timeIsDouble = true;
+    fr->time         = dbl;
+
+    if (na == 0)
+    {
+        return FALSE;
+    }
+    else
+    {
+        if (na != fr->natoms)
+        {
+            gmx_fatal(FARGS,
+                      "Number of atoms in pdb frame %d is %d instead of %d",
+                      nframes_read(status),
+                      na,
+                      fr->natoms);
+        }
+        return TRUE;
+    }
+}
+
+static int pdb_first_x(t_trxstatus* status, FILE* fp, t_trxframe* fr)
+{
+    initcount(status);
+
+    fprintf(stderr, "Reading frames from pdb file");
+    frewind(fp);
+    get_pdb_coordnum(fp, &fr->natoms);
+    if (fr->natoms == 0)
+    {
+        gmx_fatal(FARGS, "\nNo coordinates in pdb file\n");
+    }
+    frewind(fp);
+    snew(fr->x, fr->natoms);
+    pdb_next_x(status, fp, fr);
+
+    return fr->natoms;
+}
+
+static bool cif_next_x(t_trxstatus* status, t_trxframe* fr)
+{
+    // The whole mmCIF file was parsed in cif_first_x; hand out one model per call.
+    return status->cifReader != nullptr && status->cifReader->readNextFrame(fr);
+}
+
+static int cif_first_x(t_trxstatus* status, const std::filesystem::path& fn, t_trxframe* fr)
+{
+    initcount(status);
+
+    fprintf(stderr, "Reading frames from cif file");
+    status->cifReader = CifIO::openTrajectory(fn);
+    if (status->cifReader == nullptr)
+    {
+        fr->natoms = 0;
+        return 0;
+    }
+    fr->natoms = status->cifReader->numAtoms();
+    if (fr->natoms == 0)
+    {
+        gmx_fatal(FARGS, "\nNo coordinates in cif file\n");
+    }
+    snew(fr->x, fr->natoms);
+    cif_next_x(status, fr);
+
+    return fr->natoms;
+}
+
+bool read_next_frame(const gmx_output_env_t* oenv, t_trxstatus* status, t_trxframe* fr)
+{
+    int      ct;
+    gmx_bool bOK, bMissingData = FALSE, bSkip = FALSE;
+    bool     bRet = false;
+
+    const double pt = status->tf;
+
+    MSVC_DIAGNOSTIC_IGNORE(6237) // We intend to skip calling gmx_fio_is_double sometimes
+    const bool buildIsDoublePrecision = GMX_DOUBLE;
+    const bool compareTimesAsDouble =
+            (buildIsDoublePrecision && (status->fio ? gmx_fio_is_double(status->fio) : false));
+    MSVC_DIAGNOSTIC_RESET
+    do
+    {
+        clear_trxframe(fr, FALSE);
+
+        auto startTime = status->timeControl.begin;
+        switch (status->fileType)
+        {
+            case efTRR: bRet = gmx_next_frame(status, fr); break;
+            case efCPT:
+                /* Checkpoint files can not contain multiple frames */
+                break;
+            case efG96:
+            {
+                t_symtab* symtab = nullptr;
+                read_g96_conf(
+                        gmx_fio_getfp(status->fio), {}, nullptr, fr, symtab, status->persistent_line.data());
+                bRet = (fr->natoms > 0);
+                break;
+            }
+            case efXTC:
+            {
+                real timeAsReal;
+                if (startTime.has_value() && (status->tf < startTime.value()))
+                {
+                    if (xtc_seek_time(status->fio, startTime.value(), fr->natoms, TRUE))
+                    {
+                        gmx_fatal(FARGS,
+                                  "Specified frame (time %f) doesn't exist or file "
+                                  "corrupt/inconsistent.",
+                                  startTime.value());
+                    }
+                    initcount(status);
+                }
+                bRet             = (read_next_xtc(
+                                status->fio, fr->natoms, &fr->step, &timeAsReal, fr->box, fr->x, &fr->prec, &bOK)
+                        != 0);
+                fr->bPrec        = (bRet && fr->prec > 0);
+                fr->bStep        = bRet;
+                fr->bTime        = bRet;
+                fr->timeIsDouble = false;
+                fr->bX           = bRet;
+                fr->bBox         = bRet;
+                if (bRet)
+                {
+                    fr->time = static_cast<double>(timeAsReal);
+                }
+                if (!bOK)
+                {
+                    /* Actually the header could also be not ok,
+                       but from bOK from read_next_xtc this can't be distinguished */
+                    fr->not_ok = DATA_NOT_OK;
+                }
+                break;
+            }
+            case efTNG: bRet = gmx_read_next_tng_frame(status->tng, fr, nullptr, 0); break;
+            case efH5MD: bRet = status->h5md->readNextFrame(fr); break;
+            case efPDB: bRet = pdb_next_x(status, gmx_fio_getfp(status->fio), fr); break;
+            case efCIF: bRet = cif_next_x(status, fr); break;
+            case efGRO: bRet = gro_next_x_or_v(gmx_fio_getfp(status->fio), fr); break;
+            default:
+#if GMX_USE_PLUGINS
+                bRet = read_next_vmd_frame(status->vmdplugin, fr);
+#else
+                gmx_fatal(FARGS,
+                          "DEATH HORROR in read_next_frame fileType=%s,status=%s",
+                          ftp2ext(status->fileType),
+                          gmx_fio_getname(status->fio).string().c_str());
+#endif
+        }
+        status->tf = fr->time;
+
+        if (bRet)
+        {
+            bMissingData = ((((status->flags & TRX_NEED_X) != 0) && !fr->bX)
+                            || (((status->flags & TRX_NEED_V) != 0) && !fr->bV)
+                            || (((status->flags & TRX_NEED_F) != 0) && !fr->bF));
+            bSkip        = FALSE;
+            if (!bMissingData)
+            {
+                ct = check_times2(fr->time, status->t0, status->timeControl, compareTimesAsDouble);
+                if (ct == 0 || ((status->flags & TRX_DONT_SKIP) && ct < 0))
+                {
+                    printcount(status, oenv, fr->time, FALSE);
+                }
+                else if (ct > 0)
+                {
+                    bRet = false;
+                }
+                else
+                {
+                    printcount(status, oenv, fr->time, TRUE);
+                    bSkip = TRUE;
+                }
+            }
+        }
+
+    } while (bRet && (bMissingData || bSkip));
+
+    if (!bRet)
+    {
+        printlast(status, oenv, pt);
+        if (fr->not_ok)
+        {
+            printincomp(status, fr);
+        }
+    }
+
+    return bRet;
+}
+
+bool read_first_frame(const gmx_output_env_t*      oenv,
+                      t_trxstatus**                status,
+                      const std::filesystem::path& fn,
+                      t_trxframe*                  fr,
+                      const gmx::TimeControl*      timeControl,
+                      int                          flags)
+{
+    t_fileio* fio = nullptr;
+    gmx_bool  bFirst, bOK;
+    real      timeAsReal;
+
+    clear_trxframe(fr, TRUE);
+
+    bFirst = TRUE;
+
+    *status = new t_trxstatus;
+
+    (*status)->flags    = flags;
+    (*status)->fileType = fn2ftp(fn);
+    if (timeControl != nullptr)
+    {
+        (*status)->timeControl = *timeControl;
+    }
+
+    if (efTNG == (*status)->fileType)
+    {
+        /* Special treatment for TNG files */
+        gmx_tng_open(fn, 'r', &(*status)->tng);
+    }
+    else if (efH5MD == (*status)->fileType)
+    {
+        (*status)->h5md = std::make_unique<gmx::H5md>(fn, gmx::H5mdFileMode('r'));
+        (*status)->h5md->setupFromExistingFile();
+    }
+    else if ((*status)->fileType != efCPT)
+    {
+        fio = (*status)->fio = gmx_fio_open(fn, "r");
+    }
+    switch ((*status)->fileType)
+    {
+        case efTRR: break;
+        case efCPT:
+            // Only one frame can be read from a checkpoint, so we don't
+            // want to leave an open file handle around.
+            gmx::read_checkpoint_trxframe(fn, fr);
+            bFirst = FALSE;
+            break;
+        case efG96:
+        {
+            /* Can not rewind a compressed file, so open it twice */
+            if ((*status)->persistent_line.empty())
+            {
+                /* allocate the persistent line */
+                (*status)->persistent_line.resize(STRLEN + 1);
+            }
+            t_symtab* symtab = nullptr;
+            read_g96_conf(gmx_fio_getfp(fio), fn, nullptr, fr, symtab, (*status)->persistent_line.data());
+            gmx_fio_close(fio);
+            clear_trxframe(fr, FALSE);
+            if (flags & (TRX_READ_X | TRX_NEED_X))
+            {
+                snew(fr->x, fr->natoms);
+            }
+            if (flags & (TRX_READ_V | TRX_NEED_V))
+            {
+                snew(fr->v, fr->natoms);
+            }
+            (*status)->fio = gmx_fio_open(fn, "r");
+            break;
+        }
+        case efXTC:
+            if (read_first_xtc(fio, &fr->natoms, &fr->step, &timeAsReal, fr->box, &fr->x, &fr->prec, &bOK) == 0)
+            {
+                GMX_RELEASE_ASSERT(!bOK,
+                                   "Inconsistent results - OK status from read_first_xtc, but 0 "
+                                   "atom coords read");
+                fr->not_ok = DATA_NOT_OK;
+            }
+            if (fr->not_ok)
+            {
+                fr->natoms = 0;
+                printincomp(*status, fr);
+            }
+            else
+            {
+                fr->bPrec        = (fr->prec > 0);
+                fr->bStep        = TRUE;
+                fr->bTime        = TRUE;
+                fr->timeIsDouble = false;
+                fr->bX           = TRUE;
+                fr->bBox         = TRUE;
+                fr->time         = static_cast<double>(timeAsReal);
+                printcount(*status, oenv, fr->time, FALSE);
+            }
+            bFirst = FALSE;
+            break;
+        case efTNG:
+            fr->step = -1;
+            if (!gmx_read_next_tng_frame((*status)->tng, fr, nullptr, 0))
+            {
+                fr->not_ok = DATA_NOT_OK;
+                fr->natoms = 0;
+                printincomp(*status, fr);
+            }
+            else
+            {
+                printcount(*status, oenv, fr->time, FALSE);
+            }
+            bFirst = FALSE;
+            break;
+        case efH5MD:
+            fr->step = -1;
+            if (!(*status)->h5md->readNextFrame(fr))
+            {
+                fr->not_ok = DATA_NOT_OK;
+                fr->natoms = 0;
+                printincomp(*status, fr);
+            }
+            else
+            {
+                printcount(*status, oenv, fr->time, FALSE);
+            }
+            bFirst = FALSE;
+            break;
+        case efPDB:
+            pdb_first_x(*status, gmx_fio_getfp(fio), fr);
+            if (fr->natoms)
+            {
+                printcount(*status, oenv, fr->time, FALSE);
+            }
+            bFirst = FALSE;
+            break;
+        case efCIF:
+            cif_first_x(*status, fn, fr);
+            if (fr->natoms)
+            {
+                printcount(*status, oenv, fr->time, FALSE);
+            }
+            bFirst = FALSE;
+            break;
+        case efGRO:
+            if (gro_first_x_or_v(gmx_fio_getfp(fio), fr))
+            {
+                printcount(*status, oenv, fr->time, FALSE);
+            }
+            bFirst = FALSE;
+            break;
+        default:
+#if GMX_USE_PLUGINS
+            fprintf(stderr,
+                    "The file format of %s is not a known trajectory format to GROMACS.\n"
+                    "Please make sure that the file is a trajectory!\n"
+                    "GROMACS will now assume it to be a trajectory and will try to open it using "
+                    "the VMD plug-ins.\n"
+                    "This will only work in case the VMD plugins are found and it is a trajectory "
+                    "format supported by VMD.\n",
+                    fn.string().c_str());
+            gmx_fio_fp_close(fio); /*only close the file without removing FIO entry*/
+            if (!read_first_vmd_frame(fn, &(*status)->vmdplugin, fr))
+            {
+                gmx_fatal(FARGS, "Not supported in read_first_frame: %s", fn.string().c_str());
+            }
+#else
+            gmx_fatal(FARGS,
+                      "Not supported in read_first_frame: %s. Please make sure that the file is a "
+                      "trajectory.\n"
+                      "GROMACS is not compiled with plug-in support. Thus it cannot read "
+                      "non-GROMACS trajectory formats using the VMD plug-ins.\n"
+                      "Please compile with plug-in support if you want to read non-GROMACS "
+                      "trajectory formats.\n",
+                      fn.string().c_str());
+#endif
+    }
+    (*status)->tf = fr->time;
+
+    /* Return FALSE if we read a frame that's past the set ending time. */
+    if (!bFirst && (!(flags & TRX_DONT_SKIP) && check_times(fr->time, (*status)->timeControl) > 0))
+    {
+        (*status)->t0 = fr->time;
+        return FALSE;
+    }
+
+    if (bFirst || (!(flags & TRX_DONT_SKIP) && check_times(fr->time, (*status)->timeControl) < 0))
+    {
+        /* Read a frame when no frame was read or the first was skipped */
+        if (!read_next_frame(oenv, *status, fr))
+        {
+            return FALSE;
+        }
+    }
+    (*status)->t0 = fr->time;
+
+    /* We need the number of atoms for random-access XTC searching, even when
+     * we don't have access to the actual frame data.
+     */
+    (*status)->natoms = fr->natoms;
+
+    return (fr->natoms > 0);
+}
+
+/***** C O O R D I N A T E   S T U F F *****/
+
+int read_first_x(const gmx_output_env_t*      oenv,
+                 t_trxstatus**                status,
+                 const std::filesystem::path& fn,
+                 double*                      t,
+                 rvec**                       x,
+                 matrix                       box,
+                 const gmx::TimeControl*      timeControl)
+{
+    t_trxframe fr;
+
+    read_first_frame(oenv, status, fn, &fr, timeControl, TRX_NEED_X);
+
+    snew((*status)->xframe, 1);
+    (*(*status)->xframe) = fr;
+    *t                   = (*status)->xframe->time;
+    *x                   = (*status)->xframe->x;
+    copy_mat((*status)->xframe->box, box);
+
+    return (*status)->xframe->natoms;
+}
+
+gmx_bool read_next_x(const gmx_output_env_t* oenv, t_trxstatus* status, double* t, rvec x[], matrix box)
+{
+    gmx_bool bRet;
+
+    status->xframe->x = x;
+    /*xframe[status].x = x;*/
+    bRet = read_next_frame(oenv, status, status->xframe);
+    *t   = status->xframe->time;
+    copy_mat(status->xframe->box, box);
+
+    return bRet;
+}
+
+void rewind_trj(t_trxstatus* status)
+{
+    initcount(status);
+
+    gmx_fio_rewind(status->fio);
+}
+
+/***** T O P O L O G Y   S T U F F ******/
+
+t_topology* read_top(const std::filesystem::path& fn, PbcType* pbcType)
+{
+    int         natoms;
+    PbcType     pbcTypeFile;
+    t_topology* top;
+
+    snew(top, 1);
+    pbcTypeFile = read_tpx_top(fn, nullptr, nullptr, &natoms, nullptr, nullptr, top);
+    if (pbcType)
+    {
+        *pbcType = pbcTypeFile;
+    }
+
+    return top;
+}

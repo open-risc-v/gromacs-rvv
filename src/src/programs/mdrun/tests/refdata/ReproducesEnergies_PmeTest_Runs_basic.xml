@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<?xml-stylesheet type="text/xsl" href="referencedata.xsl"?>
+<ReferenceData>
+  <Energy Name="Conserved">
+    <Real Name="Time 0.000000 Step 0">39.455055</Real>
+    <Real Name="Time 0.004000 Step 4">39.452827</Real>
+    <Real Name="Time 0.008000 Step 8">39.448353</Real>
+    <Real Name="Time 0.012000 Step 12">39.450726</Real>
+    <Real Name="Time 0.016000 Step 16">39.455303</Real>
+    <Real Name="Time 0.020000 Step 20">39.453823</Real>
+  </Energy>
+  <Energy Name="Reciprocal">
+    <Real Name="Time 0.000000 Step 0">5.7102599</Real>
+    <Real Name="Time 0.004000 Step 4">5.678308</Real>
+    <Real Name="Time 0.008000 Step 8">5.5974426</Real>
+    <Real Name="Time 0.012000 Step 12">5.4712629</Real>
+    <Real Name="Time 0.016000 Step 16">5.3487535</Real>
+    <Real Name="Time 0.020000 Step 20">5.3116117</Real>
+  </Energy>
+</ReferenceData>

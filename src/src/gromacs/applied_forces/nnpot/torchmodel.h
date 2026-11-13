@@ -1,0 +1,118 @@
+/*
+ * This file is part of the GROMACS molecular simulation package.
+ *
+ * Copyright 2024- The GROMACS Authors
+ * and the project initiators Erik Lindahl, Berk Hess and David van der Spoel.
+ * Consult the AUTHORS/COPYING files and https://www.gromacs.org for details.
+ *
+ * GROMACS is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public License
+ * as published by the Free Software Foundation; either version 2.1
+ * of the License, or (at your option) any later version.
+ *
+ * GROMACS is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with GROMACS; if not, see
+ * https://www.gnu.org/licenses, or write to the Free Software Foundation,
+ * Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA.
+ *
+ * If you want to redistribute modifications to GROMACS, please
+ * consider that scientific software is very special. Version
+ * control is crucial - bugs must be traceable. We will be happy to
+ * consider code for inclusion in the official distribution, but
+ * derived work must not be called official GROMACS. Details are found
+ * in the README & COPYING files - if they are missing, get the
+ * official version at https://www.gromacs.org.
+ *
+ * To help us fund GROMACS development, we humbly ask that you cite
+ * the research papers on the package. Check out https://www.gromacs.org.
+ */
+/*! \internal \file
+ * \brief
+ * Declares a wrapper class for a TorchScript-compiled neural network model.
+ *
+ * \author Lukas Müllender <lukas.muellender@gmail.com>
+ * \ingroup module_applied_forces
+ */
+#ifndef GMX_APPLIED_FORCES_TORCHMODEL_H
+#define GMX_APPLIED_FORCES_TORCHMODEL_H
+
+#include <memory>
+#include <string>
+
+#include "gromacs/applied_forces/nnpot/nnpotmodel.h"
+
+namespace gmx
+{
+
+enum class NNPotEmbedding;
+
+class MpiComm;
+class MDLogger;
+class LinkFrontierAtom;
+
+/*! \brief
+ * Class responsible for loading and evaluating a TorchScript-compiled neural network model.
+ * Inherits from NNPotModel.
+ */
+class TorchModel : public INNPotModel
+{
+public:
+    /*! \brief Constructor for TorchModel.
+     * \param[in] filename path to the TorchScript model file
+     * \param[in] embedding embedding scheme used for NNP/MM interaction
+     * \param[in] logger handle to MDLogger
+     * \param[in] mpiComm handle to MpiComm
+     */
+    TorchModel(const std::string& filename, NNPotEmbedding embedding, const MDLogger& logger, const MpiComm& mpiComm);
+
+    ~TorchModel() override;
+
+    /*! Call inference on NN model and retrieve outputs
+     * \param[out] enerd energy data struct
+     * \param[out] forces forces on atoms
+     * \param[in] indexLookup lookup table for atom indices
+     * \param[in] mmIndices indices of MM atoms
+     * \param[in] positions atom positions
+     * \param[in] atomNumbers atom numbers
+     * \param[in] atomPairs list of all input atom pairs within cutoff
+     * \param[in] pairShifts list of periodic shift vectors corresponding to atom pairs
+     * \param[in] positionsMM MM atom positions
+     * \param[in] chargesMM MM atom charges
+     * \param[in] nnpCharge total charge of NNP region
+     * \param[in] linkFrontier link frontier atoms
+     * \param[in] box simulation box
+     * \param[in] pbcType periodic boundary conditions
+     */
+    void evaluateModel(gmx_enerdata_t*                  enerd,
+                       ArrayRef<RVec>                   forces,
+                       ArrayRef<const int32_t>          indexLookup,
+                       ArrayRef<const int32_t>          mmIndices,
+                       ArrayRef<RVec>                   positions,
+                       ArrayRef<int32_t>                atomNumbers,
+                       ArrayRef<int32_t>                atomPairs,
+                       ArrayRef<RVec>                   pairShifts,
+                       ArrayRef<RVec>                   positionsMM,
+                       ArrayRef<real>                   chargesMM,
+                       real                             nnpCharge,
+                       ArrayRef<const LinkFrontierAtom> linkFrontier,
+                       matrix&                          box,
+                       PbcType&                         pbcType) override;
+
+    //! helper function to check if model outputs forces
+    bool outputsForces() const override;
+    //! helper function to check if model outputs forces on MM atoms
+    bool outputsMMForces() const override;
+
+private:
+    class Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+} // namespace gmx
+
+#endif

@@ -1,0 +1,219 @@
+#
+# This file is part of the GROMACS molecular simulation package.
+#
+# Copyright 2010- The GROMACS Authors
+# and the project initiators Erik Lindahl, Berk Hess and David van der Spoel.
+# Consult the AUTHORS/COPYING files and https://www.gromacs.org for details.
+#
+# GROMACS is free software; you can redistribute it and/or
+# modify it under the terms of the GNU Lesser General Public License
+# as published by the Free Software Foundation; either version 2.1
+# of the License, or (at your option) any later version.
+#
+# GROMACS is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# Lesser General Public License for more details.
+#
+# You should have received a copy of the GNU Lesser General Public
+# License along with GROMACS; if not, see
+# https://www.gnu.org/licenses, or write to the Free Software Foundation,
+# Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA.
+#
+# If you want to redistribute modifications to GROMACS, please
+# consider that scientific software is very special. Version
+# control is crucial - bugs must be traceable. We will be happy to
+# consider code for inclusion in the official distribution, but
+# derived work must not be called official GROMACS. Details are found
+# in the README & COPYING files - if they are missing, get the
+# official version at https://www.gromacs.org.
+#
+# To help us fund GROMACS development, we humbly ask that you cite
+# the research papers on the package. Check out https://www.gromacs.org.
+
+add_library(mdlib INTERFACE)
+
+set(MDLIB_SOURCES
+    boxdeformation.cpp
+    broadcaststructs.cpp
+    calc_verletbuf.cpp
+    calcmu.cpp
+    calcvir.cpp
+    checkpointhandler.cpp
+    constr.cpp
+    constraint_gpu_helpers.cpp
+    constraintrange.cpp
+    coupling.cpp
+    dispersioncorrection.cpp
+    ebin.cpp
+    enerdata_utils.cpp
+    energydrifttracker.cpp
+    energyoutput.cpp
+    expanded.cpp
+    expanded_internal.cpp
+    force.cpp
+    forcerec.cpp
+    freeenergyparameters.cpp
+    gmx_omp_nthreads.cpp
+    groupcoord.cpp
+    lincs.cpp
+    lincs_constraint_group_sizes.cpp
+    md_support.cpp
+    mdebin_bar.cpp
+    mdgraph_gpu_impl.cpp
+    mdoutf.cpp
+    membed.cpp
+    perf_est.cpp
+    rbin.cpp
+    resethandler.cpp
+    rf_util.cpp
+    settle.cpp
+    shake.cpp
+    sighandler.cpp
+    sim_util.cpp
+    simulationsignal.cpp
+    splitter.cpp
+    stat.cpp
+    stophandler.cpp
+    tgroup.cpp
+    trajectory_writing.cpp
+    update.cpp
+    update_vv.cpp
+    updategroups.cpp
+    updategroupscog.cpp
+    vcm.cpp
+    vsite.cpp
+    wall.cpp
+    wholemoleculetransform.cpp
+    )
+list(TRANSFORM MDLIB_SOURCES PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/")
+set(MDLIB_SOURCES ${MDLIB_SOURCES} PARENT_SCOPE)
+
+if(GMX_GPU_CUDA)
+    gmx_add_libgromacs_sources(
+       gpuforcereduction_impl.cpp
+       gpuforcereduction_impl_internal.cu
+       leapfrog_gpu.cpp
+       leapfrog_gpu_internal.cu
+       lincs_gpu.cpp
+       settle_gpu.cpp
+       settle_gpu_internal.cu
+       stochasticdynamics_gpu.cpp
+       stochasticdynamics_gpu_internal.cu
+       update_constrain_gpu_impl.cpp
+       update_constrain_gpu_internal.cu
+       mdgraph_gpu_impl.cu
+       )
+    # Clang-18 seems to emit bad ptx for this file, so we omit it from
+    # the CI build that does clang-tidy analysis of a CUDA build.
+    if (NOT GMX_CLANG_TIDY)
+       gmx_add_libgromacs_sources(lincs_gpu_internal.cu)
+    endif()
+    _gmx_add_files_to_property(CUDA_SOURCES
+       gpuforcereduction_impl.cpp
+       leapfrog_gpu.cpp
+       lincs_gpu.cpp
+       settle_gpu.cpp
+       stochasticdynamics_gpu.cpp
+       update_constrain_gpu_impl.cpp
+       )
+elseif(GMX_GPU_HIP)
+    gmx_add_libgromacs_sources(
+       gpuforcereduction_impl.cpp
+       gpuforcereduction_impl_internal_hip.cpp
+       leapfrog_gpu.cpp
+       leapfrog_gpu_internal_hip.cpp
+       lincs_gpu.cpp
+       lincs_gpu_internal_hip.cpp
+       settle_gpu.cpp
+       settle_gpu_internal_hip.cpp
+       stochasticdynamics_gpu.cpp
+       stochasticdynamics_gpu_internal_hip.cpp
+       update_constrain_gpu_impl.cpp
+       update_constrain_gpu_internal_hip.cpp
+       )
+    _gmx_add_files_to_property(HIP_SOURCES
+       gpuforcereduction_impl.cpp
+       gpuforcereduction_impl_internal_hip.cpp
+       leapfrog_gpu.cpp
+       leapfrog_gpu_internal_hip.cpp
+       lincs_gpu.cpp
+       lincs_gpu_internal_hip.cpp
+       settle_gpu.cpp
+       settle_gpu_internal_hip.cpp
+       stochasticdynamics_gpu.cpp
+       stochasticdynamics_gpu_internal_hip.cpp
+       update_constrain_gpu_impl.cpp
+       update_constrain_gpu_internal_hip.cpp
+       )
+elseif(GMX_GPU_SYCL)
+    gmx_add_libgromacs_sources(
+        gpuforcereduction_impl.cpp
+        gpuforcereduction_impl_internal_sycl.cpp
+        leapfrog_gpu.cpp
+        leapfrog_gpu_internal_sycl.cpp
+        lincs_gpu.cpp
+        lincs_gpu_internal_sycl.cpp
+        mdgraph_gpu_impl_sycl.cpp
+        settle_gpu.cpp
+        settle_gpu_internal_sycl.cpp
+        stochasticdynamics_gpu.cpp
+        stochasticdynamics_gpu_internal_sycl.cpp
+        update_constrain_gpu_impl.cpp
+        update_constrain_gpu_internal_sycl.cpp
+    )
+
+    _gmx_add_files_to_property(SYCL_SOURCES
+        gpuforcereduction_impl.cpp
+        gpuforcereduction_impl_internal_sycl.cpp
+        leapfrog_gpu.cpp
+        leapfrog_gpu_internal_sycl.cpp
+        lincs_gpu.cpp
+        lincs_gpu_internal_sycl.cpp
+        mdgraph_gpu_impl.cpp
+        mdgraph_gpu_impl_sycl.cpp
+        settle_gpu.cpp
+        settle_gpu_internal_sycl.cpp
+        stochasticdynamics_gpu.cpp
+        stochasticdynamics_gpu_internal_sycl.cpp
+        update_constrain_gpu_impl.cpp
+        update_constrain_gpu_internal_sycl.cpp
+    )
+else()
+    gmx_add_libgromacs_sources(
+        gpuforcereduction_impl_stubs.cpp
+        update_constrain_gpu_impl_stubs.cpp
+    )
+endif()
+# Source files have the following private module dependencies.
+target_link_libraries(mdlib PRIVATE
+#                      gmxlib
+#                      math
+#                      mdtypes
+#                      tng_io
+                      )
+
+# Public interface for modules, including dependencies and interfaces
+#target_include_directories(mdlib PUBLIC
+#                           $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+#target_link_libraries(mdlib PUBLIC
+target_link_libraries(mdlib INTERFACE
+                      legacy_api
+                      pbcutil
+                      pulling
+                      topology
+                      timing
+                      )
+
+# TODO: when mdlib is an OBJECT target
+#target_link_libraries(mdlib PUBLIC legacy_api)
+#target_link_libraries(mdlib PRIVATE common)
+
+# Source files have the following private module dependencies.
+#target_link_libraries(mdlib PRIVATE tng_io)
+# TODO: Explicitly link specific modules.
+#target_link_libraries(mdlib PRIVATE legacy_modules)
+
+if (BUILD_TESTING)
+    add_subdirectory(tests)
+endif()
