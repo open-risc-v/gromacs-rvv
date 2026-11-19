@@ -30,3 +30,10 @@ perf top（剩余热点，按占比排序）：
 3.
 结论：覆盖度 f=____；停止理由：____
 ```
+
+## 上游构建修复（真机 rv64gcv）
+
+- 失败：`GMXRC.cmakein` / `GMXRC.bash.cmakein` 不存在（`scripts/CMakeLists.txt:39` configure_file）。
+- 根因：`src/scripts` 只有 6 个文件（`scripts/GMXRC*` 全缺），`baseline/scripts` 有 10 个；又是复制 src 时被 `.gitignore`/稀疏拷贝吞掉。
+- 处置：`rsync -a --ignore-existing baseline/ src/` 补齐到 10 个文件，baseline 未动。
+- 结果：`00_framework` 2 文件、`01_gromacs` 2 文件逐字节一致，A/B **ALL PASS**。
