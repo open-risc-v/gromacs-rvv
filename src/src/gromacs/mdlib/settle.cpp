@@ -54,6 +54,7 @@
 #include "gromacs/math/invertmatrix.h"
 #include "gromacs/mdlib/constr.h"
 #include "gromacs/mdlib/settle.h"
+
 #include "gromacs/mdtypes/md_enums.h"
 #include "gromacs/pbcutil/ishift.h"
 #include "gromacs/pbcutil/pbc.h"
@@ -399,6 +400,10 @@ void settle_proj(const SettleData&    settled,
 }
 
 
+#if defined(RVV_KERNELS) && defined(__riscv_v)
+#include "gromacs/mdlib/riscv/settle_rvv.h"
+#endif
+
 /*! \brief The actual settle code, templated for real/SimdReal and for optimization */
 template<typename T, typename TypeBool, int packSize, typename TypePbc, bool bCorrectVelocity, bool bCalcVirial>
 static void settleTemplate(const SettleData&  settled,
@@ -430,6 +435,14 @@ static void settleTemplate(const SettleData&  settled,
 
     assert(settleStart % packSize == 0);
     assert(settleEnd % packSize == 0);
+#if defined(RVV_KERNELS) && defined(__riscv_v)
+    if (packSize == 1)
+    {
+        settle_rvv(settled, pbc, settleStart, settleEnd, x, xprime, invdt, v,
+                   bCalcVirial, vir_r_m_dr, bErrorHasOccurred);
+        return;
+    }
+#endif
 
     TypeBool bError = TypeBool(false);
 
